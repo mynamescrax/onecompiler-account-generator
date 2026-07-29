@@ -86,6 +86,23 @@ def generate_human_name() -> str:
     return f"{first} {last}"
 
 
+def _click_safe(page, selector, evaluate_fn=None):
+    try:
+        loc = page.locator(selector)
+        if loc.count() > 0 and loc.first.is_visible():
+            loc.first.click(force=True, timeout=5000)
+            return True
+    except Exception:
+        pass
+    try:
+        if evaluate_fn:
+            page.evaluate(evaluate_fn)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def extract_token(page) -> str:
     try:
         token = page.evaluate("""
@@ -326,6 +343,7 @@ def signup(email, password, mail=None):
         with Camoufox(
             i_know_what_im_doing=True,
             disable_coop=True,
+            headless=CONFIG.get('headless', False),
             window=(CONFIG['viewport_width'], CONFIG['viewport_height']),
         ) as browser:
             page = browser.new_page()
@@ -335,23 +353,23 @@ def signup(email, password, mail=None):
                 time.sleep(5)
                 page.wait_for_selector('button, a, input', timeout=30000)
 
+                page.bring_to_front()
+
                 # Click Login button
                 login_clicked = False
                 for sel in ['button[aria-label="Login"]', 'button:has-text("Login")', 'button:has-text("Log in")', 'a:has-text("Login")', 'a:has-text("Log in")']:
-                    loc = page.locator(sel)
-                    if loc.count() > 0 and loc.first.is_visible():
-                        loc.first.click()
+                    if _click_safe(page, sel):
                         login_clicked = True
                         time.sleep(1.5)
                         break
                 if not login_clicked:
-                    page.evaluate("""
+                    login_clicked = page.evaluate("""
                         () => {
                             const buttons = document.querySelectorAll('button, a');
                             for (const btn of buttons) {
                                 const t = (btn.textContent || '').trim().toLowerCase();
                                 const l = (btn.getAttribute('aria-label') || '').toLowerCase();
-                                if (t === 'login' || t === 'log in' || l === 'login' || l === 'log in') { btn.click(); return true; }
+                                if (t === 'login' || t === 'log in' || l === 'login' || l === 'log in') { btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window})); return true; }
                             }
                             return false;
                         }
@@ -359,26 +377,23 @@ def signup(email, password, mail=None):
                     time.sleep(1.5)
 
                 # Click Sign Up link
-                signup_link = None
+                signup_clicked = False
                 for sel in ['button:has-text("Sign Up")', 'button:has-text("Sign up")', 'a:has-text("Sign Up")', 'a:has-text("Sign up")', 'button:has-text("New to OneCompiler")', 'a:has-text("New to OneCompiler")']:
-                    loc = page.locator(sel)
-                    if loc.count() > 0 and loc.first.is_visible():
-                        signup_link = loc.first
+                    if _click_safe(page, sel):
+                        signup_clicked = True
+                        time.sleep(1)
                         break
-                if not signup_link:
+                if not signup_clicked:
                     page.evaluate("""
                         () => {
                             const els = document.querySelectorAll('button, a');
                             for (const el of els) {
                                 const t = (el.textContent || '').trim().toLowerCase();
-                                if (t.includes('sign up') || t.includes('new to onecompiler') || t.includes('create new account')) { el.click(); return true; }
+                                if (t.includes('sign up') || t.includes('new to onecompiler') || t.includes('create new account')) { el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window})); return true; }
                             }
                             return false;
                         }
                     """)
-                    time.sleep(1)
-                if signup_link:
-                    signup_link.click()
                     time.sleep(1)
 
                 # Fill name
@@ -436,17 +451,25 @@ def signup(email, password, mail=None):
                 time.sleep(1)
 
                 # Submit
-                submit_btn = None
+                submit_clicked = False
                 for sel in ['button:has-text("Sign Up"):not([disabled])', 'button:has-text("Sign up"):not([disabled])']:
-                    loc = page.locator(sel)
-                    if loc.count() > 0 and loc.first.is_visible():
-                        submit_btn = loc.first
+                    if _click_safe(page, sel):
+                        submit_clicked = True
                         break
-                if not submit_btn:
+                if not submit_clicked:
+                    submit_clicked = page.evaluate("""
+                        () => {
+                            const btns = document.querySelectorAll('button');
+                            for (const btn of btns) {
+                                if (!btn.disabled && (btn.textContent || '').trim().toLowerCase().includes('sign up')) { btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window})); return true; }
+                            }
+                            return false;
+                        }
+                    """)
+                if not submit_clicked:
                     logger.error("No submit button found")
                     browser.close()
                     return None
-                submit_btn.click()
                 time.sleep(3)
 
                 # Wait for OTP field
@@ -490,17 +513,26 @@ def signup(email, password, mail=None):
                 time.sleep(1)
 
                 # Finish signup
-                finish_btn = None
+                finish_clicked = False
                 for sel in ['button:has-text("Finish Sign Up")', 'button:has-text("Finish sign up")', 'button:has-text("Verify")', 'button:has-text("Confirm")']:
-                    loc = page.locator(sel)
-                    if loc.count() > 0 and loc.first.is_visible():
-                        finish_btn = loc.first
+                    if _click_safe(page, sel):
+                        finish_clicked = True
                         break
-                if not finish_btn:
+                if not finish_clicked:
+                    finish_clicked = page.evaluate("""
+                        () => {
+                            const btns = document.querySelectorAll('button');
+                            for (const btn of btns) {
+                                const t = (btn.textContent || '').trim().toLowerCase();
+                                if (t.includes('finish sign up') || t.includes('verify') || t.includes('confirm')) { btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window})); return true; }
+                            }
+                            return false;
+                        }
+                    """)
+                if not finish_clicked:
                     logger.error("No finish button found")
                     browser.close()
                     return None
-                finish_btn.click()
                 time.sleep(5)
 
                 # Extract token

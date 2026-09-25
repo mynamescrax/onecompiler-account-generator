@@ -3,6 +3,7 @@ import random
 import logging
 import sys
 import re
+import hashlib
 import threading
 import requests
 from pathlib import Path
@@ -256,6 +257,8 @@ class TempMailBase:
         self.ready = threading.Event()
         self.session = requests.Session()
         self._seen_log = set()
+        self.rate_limited = False
+        self.retry_after = 0
 
     def _log_new_email(self, msg_id, message=None):
         if msg_id in self._seen_log:
@@ -273,11 +276,12 @@ class TempMailBase:
     def get_otp(self, timeout=90):
         start_time = time.time()
         seen_ids = set()
+        poll = getattr(self, 'poll_interval', 3)
         while time.time() - start_time < timeout:
             try:
                 messages = self.fetch_messages()
             except Exception:
-                time.sleep(3)
+                time.sleep(poll)
                 continue
 
             for msg_id, text_content, html_content in messages:
@@ -291,211 +295,73 @@ class TempMailBase:
                 if otp:
                     return otp
 
-            time.sleep(3)
+            time.sleep(poll)
 
         logger.warning(f"Timeout waiting for OTP email ({self.name})")
         return None
 
 
-class MailTmLike(TempMailBase):
-
-    name = 'mailtm'
-    BASE = 'https://api.mail.tm'
-
-    def create_account(self):
-        for attempt in range(5):
-            try:
-                resp = self.session.get(f'{self.BASE}/domains', timeout=20)
-                if resp.status_code == 429:
-                    time.sleep(3 + attempt * 3 + random.uniform(0, 2))
-                    continue
-                if resp.status_code != 200:
-                    logger.warning(f"{self.name} offline (GET /domains {resp.status_code}), skipping")
-                    return False
-                domains = resp.json().get('hydra:member', [])
-                if not domains:
-                    continue
-                domain = domains[0]['domain']
-
-                addr = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=12))
-                self.email = f'{addr}@{domain}'
-
-                resp = self.session.post(f'{self.BASE}/accounts', json={
-                    'address': self.email,
-                    'password': self.PASSWORD,
-                }, timeout=20)
-                if resp.status_code in [200, 201, 422]:
-                    return self._login()
-                elif resp.status_code == 429:
-                    time.sleep(5 + attempt * 3 + random.uniform(0, 3))
-                    continue
-                else:
-                    logger.warning(f"{self.name} account create failed: {resp.status_code}, skipping")
-                    return False
-            except Exception:
-                return False
-        return False
-
-    def _login(self):
-        try:
-            resp = self.session.post(f'{self.BASE}/token', json={
-                'address': self.email,
-                'password': self.PASSWORD,
-            }, timeout=20)
-            if resp.status_code in [200, 201]:
-                self.token = resp.json().get('token')
-                if self.token:
-                    self.session.headers['Authorization'] = f'Bearer {self.token}'
-                    self.ready.set()
-                    return True
-            return False
-        except Exception:
-            return False
-
-    def fetch_messages(self):
-        resp = self.session.get(f'{self.BASE}/messages', timeout=20)
-        if resp.status_code != 200:
-            return []
-        try:
-            data = resp.json()
-        except Exception:
-            return []
-        messages = data.get('hydra:member', []) if isinstance(data, dict) else []
-
-        out = []
-        for msg_summary in messages:
-            msg_id = msg_summary.get('id', '')
-            subject = msg_summary.get('subject', '') or ''
-            try:
-                full_msg = self.session.get(f'{self.BASE}/messages/{msg_id}', timeout=20).json()
-            except Exception:
-                continue
-
-            text_content = full_msg.get('text', '') or full_msg.get('body', '') or ''
-            html_content = full_msg.get('html', '')
-            if isinstance(html_content, list):
-                html_content = ' '.join(html_content)
-            out.append((msg_id, subject + '\n' + text_content, html_content))
-        return out
-
-
-class DrafterMail(TempMailBase):
-
-    name = 'drafter'
-    BASE = 'https://mail.drafterplus.nl'
+class TempMailLol(TempMailBase):
+    # https://tempmail.lol/en/api (API v2, free tier - no API key required)
+    name = 'tempmail.lol'
+    BASE = 'https://api.tempmail.lol/v2'
 
     def create_account(self):
+        headers = {
+            'User-Agent': 'TempMailPythonAPI/3.0',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+        }
         for attempt in range(5):
             try:
                 resp = self.session.post(
-                    f'{self.BASE}/api/new',
-                    json={'domain': 'drafterplus.nl'},
+                    f'{self.BASE}/inbox/create',
+                    json={},
+                    headers=headers,
                     timeout=20,
                 )
                 if resp.status_code == 429:
-                    wait = 2 + attempt * 2
-                    logger.warning(f"drafter rate limited, waiting {wait:.0f}s...")
-                    time.sleep(wait)
-                    continue
-                if resp.status_code != 200:
-                    logger.warning(f"drafter offline (/api/new {resp.status_code}), skipping")
+                    self.rate_limited = True
+                    try:
+                        self.retry_after = float(resp.headers.get('Retry-After', 0)) or 60
+                    except Exception:
+                        self.retry_after = 60
+                    logger.warning("tempmail.lol rate limited, failing over to next provider...")
                     return False
-                data = resp.json()
-                if not data.get('ok'):
-                    err = data.get('error', 'unknown')
-                    if err == 'rate_limited':
-                        wait = 2 + attempt * 2
-                        logger.warning(f"drafter rate limited, waiting {wait:.0f}s...")
-                        time.sleep(wait)
-                        continue
-                    logger.warning(f"drafter create failed: {err}, skipping")
+                if resp.status_code not in (200, 201):
+                    logger.warning(f"tempmail.lol offline (/inbox/create {resp.status_code}), skipping")
                     return False
-                self.email = data.get('email')
-                self.token = data.get('token') or 'drafter'
-                if self.email:
+                try:
+                    data = resp.json()
+                except Exception:
+                    return False
+                self.email = data.get('address')
+                self.token = data.get('token')
+                if self.email and self.token:
                     self.ready.set()
-                    logger.info(f"Created drafter inbox: {self.email}")
+                    logger.info(f"Created tempmail.lol inbox: {self.email}")
                     return True
             except Exception as e:
-                logger.error(f"Error creating drafter inbox: {e}")
-                return False
-        return False
-
-    def fetch_messages(self):
-        if not self.email or '@' not in self.email:
-            return []
-
-        resp = self.session.get(
-            f'{self.BASE}/api/inbox/{self.email}?limit=80',
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            return []
-        try:
-            data = resp.json()
-        except Exception:
-            return []
-        messages = data.get('messages', []) if isinstance(data, dict) else []
-        if not isinstance(messages, list):
-            return []
-
-        out = []
-        for msg_summary in messages:
-            msg_id = str(msg_summary.get('id', '') or msg_summary.get('message_id', ''))
-            if not msg_id:
-                continue
-            subject = msg_summary.get('subject', '') or ''
-            sender = msg_summary.get('from', '') or ''
-            if subject or sender:
-                self._log_new_email(msg_id, f"  New email: subject='{subject}' from='{sender}'")
-
-            try:
-                resp2 = self.session.get(
-                    f'{self.BASE}/api/message/{msg_id}?raw=1',
-                    timeout=20,
-                )
-            except Exception:
-                continue
-            if resp2.status_code != 200:
-                continue
-            out.append((msg_id, subject + '\n' + (resp2.text or ''), ''))
-        return out
-
-
-class GuerrillaMail(TempMailBase):
-
-    name = 'guerrilla'
-    BASE = 'https://api.guerrillamail.com/ajax.php'
-
-    def create_account(self):
-        for attempt in range(5):
-            try:
-                resp = self.session.get(
-                    self.BASE,
-                    params={'f': 'get_email_address'},
-                    timeout=20,
-                )
-                if resp.status_code != 200:
-                    logger.warning(f"guerrilla offline ({resp.status_code}), skipping")
-                    return False
-                data = resp.json()
-                self.email = data.get('email_addr')
-                self.sid_token = data.get('sid_token')
-                if self.email and self.sid_token:
-                    self.token = self.sid_token
-                    self.ready.set()
-                    return True
-            except Exception:
+                logger.error(f"Error creating tempmail.lol inbox: {e}")
                 return False
             time.sleep(1.5)
         return False
 
     def fetch_messages(self):
-        resp = self.session.get(
-            self.BASE,
-            params={'f': 'get_email_list', 'sid_token': self.sid_token, 'offset': '0', 'seq': '0'},
-            timeout=20,
-        )
+        if not self.token:
+            return []
+        try:
+            resp = self.session.get(
+                f'{self.BASE}/inbox',
+                params={'token': self.token},
+                headers={
+                    'User-Agent': 'TempMailPythonAPI/3.0',
+                    'Accept': 'application/json',
+                },
+                timeout=20,
+            )
+        except Exception:
+            return []
         if resp.status_code != 200:
             return []
         try:
@@ -504,65 +370,134 @@ class GuerrillaMail(TempMailBase):
             return []
         if not isinstance(data, dict):
             return []
+        if data.get('expired'):
+            return []
+        emails = data.get('emails') or []
+        if not isinstance(emails, list):
+            return []
 
         out = []
-        for msg_summary in data.get('list', []):
-            msg_id = str(msg_summary.get('mail_id', ''))
-            if not msg_id:
+        for em in emails:
+            if not isinstance(em, dict):
                 continue
-            subject = msg_summary.get('mail_subject', '') or ''
-            sender = msg_summary.get('mail_from', '') or ''
-            logger.info(f"  New email: subject='{subject}' from='{sender}'")
-
-            text = msg_summary.get('mail_body') or msg_summary.get('mail_excerpt') or ''
-            html = msg_summary.get('mail_html') or ''
-            out.append((msg_id, subject + '\n' + text, html))
+            sender = em.get('from', '') or ''
+            recipient = em.get('to', '') or ''
+            subject = em.get('subject', '') or ''
+            body = em.get('body', '') or ''
+            html = em.get('html', '') or ''
+            date = str(em.get('date', '') or '')
+            # API v2 emails carry no id, synthesize a stable one
+            msg_id = hashlib.sha1(
+                f"{sender}|{recipient}|{subject}|{body}|{date}".encode('utf-8', 'ignore')
+            ).hexdigest()
+            if subject or sender:
+                self._log_new_email(msg_id, f"  New email: subject='{subject}' from='{sender}'")
+            text_content = subject + '\n' + body
+            html_content = html if isinstance(html, str) else ''
+            out.append((msg_id, text_content, html_content))
         return out
 
 
-class MailDrop(TempMailBase):
-
-    name = 'maildrop'
-    BASE = 'https://maildrop.cc/api/inbox'
+class TempTf(TempMailBase):
+    # https://temp.tf/document - no API key required, 60 req/min per IP
+    name = 'temp.tf'
+    BASE = 'https://temp.tf/api'
+    poll_interval = 5
 
     def create_account(self):
-        addr = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=10))
-        self.email = f'{addr}@maildrop.cc'
-        self.token = 'maildrop'
-        self.ready.set()
-        return True
+        for attempt in range(5):
+            try:
+                resp = self.session.get(
+                    f'{self.BASE}/account',
+                    params={'dot': 1, 'plus': 1},
+                    headers={
+                        'User-Agent': 'Mozilla/5.0',
+                        'Accept': 'application/json',
+                    },
+                    timeout=20,
+                )
+                if resp.status_code == 429:
+                    self.rate_limited = True
+                    try:
+                        self.retry_after = float(resp.headers.get('Retry-After', 0)) or 60
+                    except Exception:
+                        self.retry_after = 60
+                    logger.warning("temp.tf rate limited, failing over to next provider...")
+                    return False
+                if resp.status_code != 200:
+                    logger.warning(f"temp.tf offline (GET /account {resp.status_code}), skipping")
+                    return False
+                try:
+                    email = resp.json().get('email')
+                except Exception:
+                    return False
+                if email:
+                    self.email = email
+                    self.token = email  # /check authenticates with the address itself
+                    self.ready.set()
+                    logger.info(f"Created temp.tf inbox: {self.email}")
+                    return True
+            except Exception as e:
+                logger.error(f"Error creating temp.tf inbox: {e}")
+                return False
+            time.sleep(1.5)
+        return False
 
     def fetch_messages(self):
-        box = self.email.rsplit('@', 1)[0]
-
-        resp = self.session.get(f'{self.BASE}/{box}', timeout=20)
+        if not self.email:
+            return []
+        try:
+            resp = self.session.post(
+                f'{self.BASE}/check',
+                json={'email': self.email},
+                headers={
+                    'User-Agent': 'Mozilla/5.0',
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/json',
+                },
+                timeout=20,
+            )
+        except Exception:
+            return []
         if resp.status_code != 200:
             return []
         try:
             data = resp.json()
         except Exception:
             return []
-        if isinstance(data, dict):
-            data = data.get('messages', [])
+        if not isinstance(data, dict):
+            return []
+        messages = data.get('data') or []
+        if not isinstance(messages, list):
+            return []
 
         out = []
-        for msg_summary in data:
-            msg_id = str(msg_summary.get('id', ''))
-            subject = msg_summary.get('subj') or msg_summary.get('subject') or ''
-            try:
-                resp2 = self.session.get(f'{self.BASE}/{box}/{msg_id}', timeout=20)
-            except Exception:
+        for em in messages:
+            if not isinstance(em, dict):
                 continue
-            if resp2.status_code != 200:
-                continue
-            out.append((msg_id, subject + '\n' + (resp2.text or ''), ''))
+            subject = em.get('subject', '') or ''
+            sender = em.get('from', '') or ''
+            body = em.get('body', '') or ''
+            date = str(em.get('date', '') or '')
+            msg_id = f"{em.get('id', '')}|{date}|{subject}"
+            if subject or sender:
+                self._log_new_email(msg_id, f"  New email: subject='{subject}' from='{sender}'")
+            if em.get('bodyContentType') == 'html':
+                html_content = body if isinstance(body, str) else ''
+                text_content = subject + '\n' + re.sub(r'<[^>]+>', ' ', html_content)
+            else:
+                text_content = subject + '\n' + (body if isinstance(body, str) else '')
+                html_content = ''
+            out.append((msg_id, text_content, html_content))
         return out
 
 
-PROVIDERS = [DrafterMail, MailTmLike, MailDrop]
+PROVIDERS = [TempMailLol, TempTf]
 
 _provider_rotate_lock = threading.Lock()
 _provider_rotate = 0
+_provider_cooldown_lock = threading.Lock()
+_provider_cooldown = {}  # provider name -> unix timestamp until which it is skipped
 
 
 def _create_temp_mail():
@@ -572,8 +507,21 @@ def _create_temp_mail():
         start = _provider_rotate % len(PROVIDERS)
         _provider_rotate += 1
 
-    for i in range(len(PROVIDERS)):
-        provider = PROVIDERS[(start + i) % len(PROVIDERS)]()
+    order = [PROVIDERS[(start + i) % len(PROVIDERS)] for i in range(len(PROVIDERS))]
+    now = time.time()
+    with _provider_cooldown_lock:
+        available = [cls for cls in order if _provider_cooldown.get(cls.name, 0) <= now]
+    if not available:
+        with _provider_cooldown_lock:
+            earliest = min(_provider_cooldown.get(cls.name, 0) for cls in order)
+        wait = max(0, earliest - time.time())
+        if wait > 0:
+            logger.warning(f"All temp-mail providers rate limited, waiting {wait:.0f}s...")
+            time.sleep(wait)
+        available = order
+
+    for provider_cls in available:
+        provider = provider_cls()
         thread = threading.Thread(target=provider.create_account, daemon=True)
         thread.start()
         deadline = time.time() + 50
@@ -585,7 +533,13 @@ def _create_temp_mail():
             time.sleep(0.5)
         if provider.ready.is_set():
             return provider
-        logger.warning(f"Temp-mail provider {provider.name} failed, trying next...")
+        if getattr(provider, 'rate_limited', False):
+            until = time.time() + (provider.retry_after or 60)
+            with _provider_cooldown_lock:
+                _provider_cooldown[provider.name] = until
+            logger.warning(f"Temp-mail provider {provider.name} rate limited, cooling down...")
+        else:
+            logger.warning(f"Temp-mail provider {provider.name} failed, trying next...")
     return None
 
 
@@ -892,6 +846,8 @@ def _create_account(worker):
 
 
 def _worker_loop(worker, remaining):
+    recycle_after = CONFIG.get('browser_recycle_after', 50)
+    accounts_since_recycle = 0
     try:
         for _ in range(remaining):
             try:
@@ -899,6 +855,15 @@ def _worker_loop(worker, remaining):
             except Exception as e:
                 logger.error(f"Worker {worker.worker_id} crashed: {e}")
             time.sleep(1 + random.uniform(0, 1.5))
+
+            accounts_since_recycle += 1
+            if accounts_since_recycle >= recycle_after:
+                logger.info(f"[w{worker.worker_id}] recycling browser after {accounts_since_recycle} accounts...")
+                try:
+                    worker.close()
+                except Exception:
+                    pass
+                accounts_since_recycle = 0
     finally:
         worker.close()
 

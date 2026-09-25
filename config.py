@@ -8,4 +8,6 @@ CONFIG = {
 
     'turnstile_timeout': 25,
     'otp_timeout': 90,
+
+    'browser_recycle_after': 50,
 }

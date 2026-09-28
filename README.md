@@ -27,3 +27,7 @@ Output goes to `output/accounts.txt` and `output/tokens.txt`.
 | `headless` | False | Run browser headless (less reliable) |
 | `turnstile_timeout` | 30 | Seconds to wait for Turnstile |
 | `otp_timeout` | 90 | Seconds to wait for OTP email |
+
+
+
+old and unused now, will not be updated
